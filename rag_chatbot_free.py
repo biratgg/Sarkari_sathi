@@ -3,6 +3,21 @@ from vector_store_free import PineconeVectorStoreFree
 from config import Config
 import logging
 
+# Try/except import fallback for rapidfuzz and fuzzywuzzy
+try:
+    from rapidfuzz import fuzz, process  # Preferred for fuzzy matching
+except ImportError:
+    try:
+        from fuzzywuzzy import fuzz, process  # Fallback if rapidfuzz is unavailable
+        import warnings
+        warnings.warn("rapidfuzz not found, using fuzzywuzzy instead. For best performance, install rapidfuzz.")
+    except ImportError:
+        def fuzz(*args, **kwargs):
+            raise ImportError("No fuzzy matching library available. Please install rapidfuzz or fuzzywuzzy.")
+        process = None
+        import warnings
+        warnings.warn("No fuzzy matching library available. Please install rapidfuzz or fuzzywuzzy.")
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,13 +39,16 @@ class RAGChatbotFree:
             return []
     
     def create_context_from_documents(self, documents: List[Dict[str, Any]]) -> str:
-        """Create context string from retrieved documents"""
+        """Create context string from retrieved documents, including title and source for better extraction"""
         if not documents:
             return "No relevant information found."
         
         context_parts = []
         for i, doc in enumerate(documents, 1):
-            context_parts.append(f"Document {i}:\n{doc['content']}\n")
+            # Add title and source for better filtering
+            title = doc.get('title', '')
+            source = doc.get('source', '')
+            context_parts.append(f"Document {i}:\nTitle: {title}\nSource: {source}\n{doc['content']}\n")
         
         return "\n".join(context_parts)
     
@@ -253,19 +271,132 @@ class RAGChatbotFree:
             return self._extract_general_information(context, query)
     
     def _extract_general_information(self, context: str, query: str) -> str:
-        """Extract general information"""
+        """Extract general information, prioritizing content from नागरिक वडापत्र and tabular data answers. For tabular data, return only the exact row for the applicant or field if present. Now supports queries by rank, gender, form number, etc. and can extract any column value for a given person."""
+        import re
         lines = context.split('\n')
         relevant_info = []
-        
+        query_lower = query.lower()
+
+        # Patterns to extract field and value from query
+        field_patterns = [
+            (r"rank[\s:]*([0-9]+)", "Rank"),
+            (r"form ?no\.?[\s:]*([0-9-]+)", "FormNo"),
+            (r"gender[\s:]*([a-zA-Z]+)", "Gender"),
+            (r"district[\s:]*([a-zA-Z]+)", "District"),
+            (r"sno\.?[\s:]*([0-9]+)", "Sno"),
+        ]
+        found_field = None
+        found_value = None
+        for pat, field in field_patterns:
+            m = re.search(pat, query_lower)
+            if m:
+                found_field = field
+                found_value = m.group(1).strip()
+                break
+
+        # If query is about a specific field (e.g., rank 1075)
+        if found_field and found_value:
+            for line in lines:
+                if '|' in line:
+                    # Extract the field value from the row
+                    field_match = re.search(rf"{found_field}: ([^|]+)", line, re.IGNORECASE)
+                    if field_match and field_match.group(1).strip() == found_value:
+                        relevant_info.append(line.strip())
+            if relevant_info:
+                response = "Based on my knowledge base, here's what I found:\n\n"
+                for info in relevant_info:
+                    response += f"• {info}\n"
+                return response
+
+        # Extract value of any column for a given person (e.g., "what is the rank of Ananda Rijal?")
+        col_patterns = [
+            (r"what is the ([a-zA-Z]+) of ([A-Z][a-z]+(?: [A-Z][a-z]+)?)", 1, 2),
+            (r"([a-zA-Z]+) of ([A-Z][a-z]+(?: [A-Z][a-z]+)?)", 1, 2),
+            (r"([a-zA-Z]+) for ([A-Z][a-z]+(?: [A-Z][a-z]+)?)", 1, 2),
+        ]
+        col_name = None
+        person_name = None
+        for pat, col_idx, name_idx in col_patterns:
+            m = re.search(pat, query, re.IGNORECASE)
+            if m:
+                col_name = m.group(col_idx).capitalize()
+                person_name = m.group(name_idx)
+                break
+        if col_name and person_name:
+            best_score = 0
+            best_row = None
+            for line in lines:
+                if 'applicant' in line.lower() and '|' in line:
+                    row_name_match = re.search(r"Applicant's Name: ([^|]+)", line)
+                    if row_name_match:
+                        row_name = row_name_match.group(1).strip()
+                        score = fuzz.partial_ratio(person_name.lower(), row_name.lower())
+                        if score > best_score and score > 80:
+                            best_score = score
+                            best_row = line.strip()
+            if best_row:
+                # Extract the requested column value from the row
+                col_match = re.search(rf"{col_name}: ([^|]+)", best_row, re.IGNORECASE)
+                if col_match:
+                    return f"The {col_name} of {person_name} is: {col_match.group(1).strip()}"
+                else:
+                    return f"Sorry, I could not find the {col_name} for {person_name}."
+
+        # Fuzzy/partial name matching (as before)
+        name_match = re.search(r'(?:is|of|for) ([A-Z][a-z]+(?: [A-Z][a-z]+)?)', query)
+        name = name_match.group(1) if name_match else None
+        best_score = 0
+        best_row = None
         for line in lines:
-            if line.strip() and not line.startswith('Document') and len(line.strip()) > 20:
-                relevant_info.append(line.strip())
-        
+            if 'applicant' in line.lower() and '|' in line:
+                row_name_match = re.search(r"Applicant's Name: ([^|]+)", line)
+                if row_name_match:
+                    row_name = row_name_match.group(1).strip()
+                    if name:
+                        score = fuzz.partial_ratio(name.lower(), row_name.lower())
+                        if score > best_score and score > 80:
+                            best_score = score
+                            best_row = line.strip()
+                    else:
+                        for word in query.split():
+                            if len(word) > 2 and fuzz.partial_ratio(word.lower(), row_name.lower()) > 85:
+                                relevant_info.append(line.strip())
+        if best_row:
+            relevant_info.append(best_row)
         if relevant_info:
             response = "Based on my knowledge base, here's what I found:\n\n"
-            for info in relevant_info[:2]:  # Limit to first 2 relevant pieces
+            for info in relevant_info:
                 response += f"• {info}\n"
             return response
+
+        # Fallback: previous logic
+        query_words = [w for w in query_lower.split() if len(w) > 2]
+        for line in lines:
+            if '|' in line:
+                if all(word in line.lower() for word in query_words):
+                    relevant_info.append(line.strip())
+        if not relevant_info:
+            for line in lines:
+                if ('नागरिक वडापत्र' in line or 'wadapatra' in line.lower() or 'citizen charter' in line.lower()) and len(line.strip()) > 20:
+                    relevant_info.append(line.strip())
+        if not relevant_info:
+            for line in lines:
+                if line.strip() and not line.startswith('Document') and len(line.strip()) > 20:
+                    relevant_info.append(line.strip())
+        if relevant_info:
+            response = "Based on my knowledge base, here's what I found:\n\n"
+            for info in relevant_info[:5]:
+                response += f"• {info}\n"
+            return response
+        # Suggest possible names if nothing found
+        possible_names = []
+        for line in lines:
+            if 'applicant' in line.lower() and '|' in line:
+                row_name_match = re.search(r"Applicant's Name: ([^|]+)", line)
+                if row_name_match:
+                    possible_names.append(row_name_match.group(1).strip())
+        if possible_names:
+            return "I couldn't find an exact match. Possible applicants in the data are: " + ', '.join(possible_names[:5])
         return "I found some relevant information, but I'm having trouble processing it right now. Please try rephrasing your question."
     
     def chat(self, query: str) -> Dict[str, Any]:

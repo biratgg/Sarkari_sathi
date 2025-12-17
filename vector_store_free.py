@@ -166,3 +166,29 @@ class PineconeVectorStoreFree:
         except Exception as e:
             logger.error(f"Failed to get index stats: {e}")
             return {}
+    
+    def find_by_source(self, source_name: str, top_k: int = 200) -> List[Dict[str, Any]]:
+        """Find all documents by source name."""
+        try:
+            # Pinecone does not support direct metadata filtering in query, so fetch all and filter
+            results = self.index.query(
+                vector=[0.0]*384,  # dummy vector as a list
+                top_k=top_k,
+                include_metadata=True
+            )
+            matches = results['matches']
+            filtered = [
+                {
+                    'id': m['id'],
+                    'score': m.get('score', 0.0),
+                    'content': m['metadata'].get('content', ''),
+                    'title': m['metadata'].get('title', ''),
+                    'source': m['metadata'].get('source', ''),
+                    'category': m['metadata'].get('category', '')
+                }
+                for m in matches if m['metadata'].get('source', '') == source_name
+            ]
+            return filtered
+        except Exception as e:
+            logger.error(f"Failed to find by source: {e}")
+            return []

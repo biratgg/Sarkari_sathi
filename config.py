@@ -24,6 +24,7 @@ class Config:
     # Free version configuration
     FREE_INDEX_NAME = "rag-chatbot-free"
     FREE_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+    FREE_EMBEDDING_DIM = 384  # all-MiniLM-L6-v2 embedding dimension
     
     # RAG Configuration
     TOP_K_RESULTS = 5
